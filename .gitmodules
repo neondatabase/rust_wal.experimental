@@ -1,0 +1,4 @@
+[submodule "sqlite"]
+	path = sqlite
+	url = https://github.com/adsharma/sqlite
+	branch = wal_replication
