@@ -1,20 +1,28 @@
 #![cfg_attr(feature = "docinclude", feature(external_doc))]
 #![cfg_attr(feature = "docinclude", doc(include = "../README.md"))]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
+use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_raft::async_trait::async_trait;
+use async_raft::error::{ChangeConfigError, ClientReadError, ClientWriteError};
 use async_raft::raft::{Entry, EntryPayload, MembershipConfig};
 use async_raft::storage::{CurrentSnapshotData, HardState, InitialState};
 use async_raft::{AppData, AppDataResponse, NodeId, RaftStorage};
+
+use async_raft::raft::{AppendEntriesRequest, AppendEntriesResponse, ClientWriteRequest};
+use async_raft::raft::{InstallSnapshotRequest, InstallSnapshotResponse};
+use async_raft::raft::{VoteRequest, VoteResponse};
+use async_raft::{Config, Raft, RaftMetrics, RaftNetwork};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
 
-const ERR_INCONSISTENT_LOG: &str = "a query was received which was expecting data to be in place which does not exist in the log";
+const ERR_INCONSISTENT_LOG: &str =
+    "a query was received which was expecting data to be in place which does not exist in the log";
 
 /// The application data request type which the `WALStore` works with.
 ///
@@ -103,7 +111,10 @@ impl WALStore {
     /// Create a new `WALStore` instance with some existing state (for testing).
     // Disabled for now, since I can't figure out how to get it to work: #[cfg(test)]
     pub fn new_with_state(
-        id: NodeId, log: BTreeMap<u64, Entry<ClientRequest>>, sm: WALStoreStateMachine, hs: Option<HardState>,
+        id: NodeId,
+        log: BTreeMap<u64, Entry<ClientRequest>>,
+        sm: WALStoreStateMachine,
+        hs: Option<HardState>,
         current_snapshot: Option<WALStoreSnapshot>,
     ) -> Self {
         let log = RwLock::new(log);
@@ -237,7 +248,11 @@ impl RaftStorage<ClientRequest, ClientResponse> for WALStore {
     }
 
     #[tracing::instrument(level = "trace", skip(self, data))]
-    async fn apply_entry_to_state_machine(&self, index: &u64, data: &ClientRequest) -> Result<ClientResponse> {
+    async fn apply_entry_to_state_machine(
+        &self,
+        index: &u64,
+        data: &ClientRequest,
+    ) -> Result<ClientResponse> {
         let mut sm = self.sm.write().await;
         sm.last_applied_log = *index;
         if let Some((serial, res)) = sm.client_serial_responses.get(&data.client) {
@@ -245,8 +260,11 @@ impl RaftStorage<ClientRequest, ClientResponse> for WALStore {
                 return Ok(ClientResponse(res.clone()));
             }
         }
-        let previous = sm.client_status.insert(data.client.clone(), data.status.clone());
-        sm.client_serial_responses.insert(data.client.clone(), (data.serial, previous.clone()));
+        let previous = sm
+            .client_status
+            .insert(data.client.clone(), data.status.clone());
+        sm.client_serial_responses
+            .insert(data.client.clone(), (data.serial, previous.clone()));
         Ok(ClientResponse(previous))
     }
 
@@ -260,8 +278,11 @@ impl RaftStorage<ClientRequest, ClientResponse> for WALStore {
                     continue;
                 }
             }
-            let previous = sm.client_status.insert(data.client.clone(), data.status.clone());
-            sm.client_serial_responses.insert(data.client.clone(), (data.serial, previous.clone()));
+            let previous = sm
+                .client_status
+                .insert(data.client.clone(), data.status.clone());
+            sm.client_serial_responses
+                .insert(data.client.clone(), (data.serial, previous.clone()));
         }
         Ok(())
     }
@@ -303,7 +324,12 @@ impl RaftStorage<ClientRequest, ClientResponse> for WALStore {
             *log = log.split_off(&last_applied_log);
             log.insert(
                 last_applied_log,
-                Entry::new_snapshot_pointer(last_applied_log, term, "".into(), membership_config.clone()),
+                Entry::new_snapshot_pointer(
+                    last_applied_log,
+                    term,
+                    "".into(),
+                    membership_config.clone(),
+                ),
             );
 
             let snapshot = WALStoreSnapshot {
@@ -316,7 +342,10 @@ impl RaftStorage<ClientRequest, ClientResponse> for WALStore {
             *current_snapshot = Some(snapshot);
         } // Release log & snapshot write locks.
 
-        tracing::trace!({ snapshot_size = snapshot_bytes.len() }, "log compaction complete");
+        tracing::trace!(
+            { snapshot_size = snapshot_bytes.len() },
+            "log compaction complete"
+        );
         Ok(CurrentSnapshotData {
             term,
             index: last_applied_log,
@@ -332,9 +361,17 @@ impl RaftStorage<ClientRequest, ClientResponse> for WALStore {
 
     #[tracing::instrument(level = "trace", skip(self, snapshot))]
     async fn finalize_snapshot_installation(
-        &self, index: u64, term: u64, delete_through: Option<u64>, id: String, snapshot: Box<Self::Snapshot>,
+        &self,
+        index: u64,
+        term: u64,
+        delete_through: Option<u64>,
+        id: String,
+        snapshot: Box<Self::Snapshot>,
     ) -> Result<()> {
-        tracing::trace!({ snapshot_size = snapshot.get_ref().len() }, "decoding snapshot for installation");
+        tracing::trace!(
+            { snapshot_size = snapshot.get_ref().len() },
+            "decoding snapshot for installation"
+        );
         let raw = serde_json::to_string_pretty(snapshot.get_ref().as_slice())?;
         println!("JSON SNAP:\n{}", raw);
         let new_snapshot: WALStoreSnapshot = serde_json::from_slice(snapshot.get_ref().as_slice())?;
@@ -358,7 +395,10 @@ impl RaftStorage<ClientRequest, ClientResponse> for WALStore {
                 }
                 None => log.clear(),
             }
-            log.insert(index, Entry::new_snapshot_pointer(index, term, id, membership_config));
+            log.insert(
+                index,
+                Entry::new_snapshot_pointer(index, term, id, membership_config),
+            );
         }
 
         // Update the state machine.
@@ -388,5 +428,229 @@ impl RaftStorage<ClientRequest, ClientResponse> for WALStore {
             }
             None => Ok(None),
         }
+    }
+}
+
+/// A concrete Raft type used during testing.
+pub type WALRaft = Raft<ClientRequest, ClientResponse, RaftRouter, WALStore>;
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// A type which emulates a network transport and implements the `RaftNetwork` trait.
+pub struct RaftRouter {
+    /// The Raft runtime config which all nodes are using.
+    config: Arc<Config>,
+    /// The table of all nodes currently known to this router instance.
+    routing_table: RwLock<BTreeMap<NodeId, (WALRaft, Arc<WALStore>)>>,
+    /// Nodes which are isolated can neither send nor receive frames.
+    isolated_nodes: RwLock<HashSet<NodeId>>,
+}
+
+impl RaftRouter {
+    /// Create a new instance.
+    pub fn new(config: Arc<Config>) -> Self {
+        Self {
+            config,
+            routing_table: Default::default(),
+            isolated_nodes: Default::default(),
+        }
+    }
+
+    /// Create and register a new Raft node bearing the given ID.
+    pub async fn new_raft_node(self: &Arc<Self>, id: NodeId) {
+        let memstore = Arc::new(WALStore::new(id));
+        let node = Raft::new(id, self.config.clone(), self.clone(), memstore.clone());
+        let mut rt = self.routing_table.write().await;
+        rt.insert(id, (node, memstore));
+    }
+
+    /// Remove the target node from the routing table & isolation.
+    pub async fn remove_node(&self, id: NodeId) -> Option<(WALRaft, Arc<WALStore>)> {
+        let mut rt = self.routing_table.write().await;
+        let opt_handles = rt.remove(&id);
+        let mut isolated = self.isolated_nodes.write().await;
+        isolated.remove(&id);
+
+        opt_handles
+    }
+
+    /// Initialize all nodes based on the config in the routing table.
+    pub async fn initialize_from_single_node(&self, node: NodeId) -> Result<()> {
+        tracing::info!({ node }, "initializing cluster from single node");
+        let rt = self.routing_table.read().await;
+        let members: HashSet<NodeId> = rt.keys().cloned().collect();
+        rt.get(&node)
+            .ok_or_else(|| anyhow!("node {} not found in routing table", node))?
+            .0
+            .initialize(members.clone())
+            .await?;
+        Ok(())
+    }
+
+    /// Isolate the network of the specified node.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn isolate_node(&self, id: NodeId) {
+        self.isolated_nodes.write().await.insert(id);
+    }
+
+    /// Get a payload of the latest metrics from each node in the cluster.
+    pub async fn latest_metrics(&self) -> Vec<RaftMetrics> {
+        let rt = self.routing_table.read().await;
+        let mut metrics = vec![];
+        for node in rt.values() {
+            metrics.push(node.0.metrics().borrow().clone());
+        }
+        metrics
+    }
+
+    /// Get the ID of the current leader.
+    pub async fn leader(&self) -> Option<NodeId> {
+        let isolated = self.isolated_nodes.read().await;
+        self.latest_metrics().await.into_iter().find_map(|node| {
+            if node.current_leader == Some(node.id) {
+                if isolated.contains(&node.id) {
+                    None
+                } else {
+                    Some(node.id)
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Restore the network of the specified node.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn restore_node(&self, id: NodeId) {
+        let mut nodes = self.isolated_nodes.write().await;
+        nodes.remove(&id);
+    }
+
+    pub async fn add_non_voter(
+        &self,
+        leader: NodeId,
+        target: NodeId,
+    ) -> Result<(), ChangeConfigError> {
+        let rt = self.routing_table.read().await;
+        let node = rt
+            .get(&leader)
+            .unwrap_or_else(|| panic!("node with ID {} does not exist", leader));
+        node.0.add_non_voter(target).await
+    }
+
+    pub async fn change_membership(
+        &self,
+        leader: NodeId,
+        members: HashSet<NodeId>,
+    ) -> Result<(), ChangeConfigError> {
+        let rt = self.routing_table.read().await;
+        let node = rt
+            .get(&leader)
+            .unwrap_or_else(|| panic!("node with ID {} does not exist", leader));
+        node.0.change_membership(members).await
+    }
+
+    /// Send a client read request to the target node.
+    pub async fn client_read(&self, target: NodeId) -> Result<(), ClientReadError> {
+        let rt = self.routing_table.read().await;
+        let node = rt
+            .get(&target)
+            .unwrap_or_else(|| panic!("node with ID {} does not exist", target));
+        node.0.client_read().await
+    }
+
+    /// Send a client request to the target node, causing test failure on error.
+    pub async fn client_request(&self, target: NodeId, client_id: &str, serial: u64) {
+        let req = ClientRequest {
+            client: client_id.into(),
+            serial,
+            status: format!("request-{}", serial),
+        };
+        if let Err(err) = self.send_client_request(target, req).await {
+            tracing::error!({error=%err}, "error from client request");
+            panic!(err)
+        }
+    }
+
+    /// Request the current leader from the target node.
+    pub async fn current_leader(&self, target: NodeId) -> Option<NodeId> {
+        let rt = self.routing_table.read().await;
+        let node = rt
+            .get(&target)
+            .unwrap_or_else(|| panic!("node with ID {} does not exist", target));
+        node.0.current_leader().await
+    }
+
+    /// Send multiple client requests to the target node, causing test failure on error.
+    pub async fn client_request_many(&self, target: NodeId, client_id: &str, count: usize) {
+        for idx in 0..count {
+            self.client_request(target, client_id, idx as u64).await
+        }
+    }
+
+    async fn send_client_request(
+        &self,
+        target: NodeId,
+        req: ClientRequest,
+    ) -> std::result::Result<ClientResponse, ClientWriteError<ClientRequest>> {
+        let rt = self.routing_table.read().await;
+        let node = rt
+            .get(&target)
+            .unwrap_or_else(|| panic!("node '{}' does not exist in routing table", target));
+        node.0
+            .client_write(ClientWriteRequest::new(req))
+            .await
+            .map(|res| res.data)
+    }
+}
+
+#[async_trait]
+impl RaftNetwork<ClientRequest> for RaftRouter {
+    /// Send an AppendEntries RPC to the target Raft node (§5).
+    async fn append_entries(
+        &self,
+        target: u64,
+        rpc: AppendEntriesRequest<ClientRequest>,
+    ) -> Result<AppendEntriesResponse> {
+        let rt = self.routing_table.read().await;
+        let isolated = self.isolated_nodes.read().await;
+        let addr = rt
+            .get(&target)
+            .expect("target node not found in routing table");
+        if isolated.contains(&target) || isolated.contains(&rpc.leader_id) {
+            return Err(anyhow!("target node is isolated"));
+        }
+        Ok(addr.0.append_entries(rpc).await?)
+    }
+
+    /// Send an InstallSnapshot RPC to the target Raft node (§7).
+    async fn install_snapshot(
+        &self,
+        target: u64,
+        rpc: InstallSnapshotRequest,
+    ) -> Result<InstallSnapshotResponse> {
+        let rt = self.routing_table.read().await;
+        let isolated = self.isolated_nodes.read().await;
+        let addr = rt
+            .get(&target)
+            .expect("target node not found in routing table");
+        if isolated.contains(&target) || isolated.contains(&rpc.leader_id) {
+            return Err(anyhow!("target node is isolated"));
+        }
+        Ok(addr.0.install_snapshot(rpc).await?)
+    }
+
+    /// Send a RequestVote RPC to the target Raft node (§5).
+    async fn vote(&self, target: u64, rpc: VoteRequest) -> Result<VoteResponse> {
+        let rt = self.routing_table.read().await;
+        let isolated = self.isolated_nodes.read().await;
+        let addr = rt
+            .get(&target)
+            .expect("target node not found in routing table");
+        if isolated.contains(&target) || isolated.contains(&rpc.candidate_id) {
+            return Err(anyhow!("target node is isolated"));
+        }
+        Ok(addr.0.vote(rpc).await?)
     }
 }

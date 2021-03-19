@@ -1,5 +1,6 @@
 use std::os::raw::c_char;
 use std::os::raw::c_int;
+use std::sync::Arc;
 
 use structopt::clap::arg_enum;
 use structopt::StructOpt;
@@ -7,7 +8,8 @@ use structopt::StructOpt;
 mod consensus;
 mod sqlite_wal;
 
-use consensus::WALStore;
+use async_raft::Config;
+use consensus::{RaftRouter, WALRaft, WALStore};
 
 arg_enum! {
     #[derive(Debug)]
@@ -46,7 +48,8 @@ enum Subcommands {
     Other(Vec<String>),
 }
 
-fn main() {
+#[tokio::main]
+pub async fn main() {
     let options = Options::from_args();
     println!("{} starting up", options.id);
 
@@ -56,9 +59,17 @@ fn main() {
     };
 
     let arg0 = String::from("mycommand");
-    let args= [vec![arg0.as_ptr()], sub_args].concat();
+    let args = [vec![arg0.as_ptr()], sub_args].concat();
 
-    let store = WALStore::new(options.id);
+    let config = Arc::new(
+        Config::build("zenith".into())
+            .validate()
+            .expect("failed to build Raft config"),
+    );
+    let network = Arc::new(RaftRouter::new(config.clone()));
+    let store = Arc::new(WALStore::new(options.id));
+    let raft = WALRaft::new(options.id, config, network, store);
+
     sqlite_wal::register_wal();
     unsafe {
         rust_wal::shell_main(args.len() as c_int, args.as_ptr() as *mut *mut c_char);
